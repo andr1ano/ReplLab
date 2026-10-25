@@ -1,0 +1,93 @@
+name: build-and-deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build-and-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and start coordinator with 3 shards (9 replicas)
+        run: docker compose --profile scale up -d --build
+
+      - name: Wait until all 3 shards x 3 replicas are registered and caught up
+        run: |
+          for i in $(seq 1 60); do
+            n=$(curl -fsS localhost:8000/shards 2>/dev/null | python3 -c "
+          import sys, json
+          g = json.load(sys.stdin)
+          print(sum(1 for s in g for r in s['replicas'] if r['alive'] and r['ready']) if len(g) >= 3 else 0)
+          " 2>/dev/null || echo 0)
+            echo "ready replicas: $n / 9"
+            [ "$n" -ge 9 ] && exit 0
+            sleep 2
+          done
+          echo "replicas did not become ready"; exit 1
+
+      - name: Show cluster state
+        run: |
+          B=localhost:8000
+
+          echo "=== health (N / W / R and whether R+W>N)"
+          curl -fsS $B/health; echo
+
+          echo "=== shards and their replicas (1 leader + 2 followers each)"
+          curl -fsS $B/shards | python3 -c "
+          import sys, json
+          for s in json.load(sys.stdin):
+              print(s['id'], 'leader =', s['leader'])
+              for r in s['replicas']:
+                  print('   ', r['id'].ljust(12), r['role'].ljust(9), 'alive =', r['alive'], 'ready =', r['ready'])
+              assert len(s['replicas']) == 3 and sum(r['role'] == 'leader' for r in s['replicas']) == 1
+          "
+
+          echo "=== stats (no data written yet)"
+          curl -fsS $B/stats | python3 -m json.tool
+          total=$(curl -fsS $B/stats | python3 -c "import sys,json; print(json.load(sys.stdin)['total'])")
+          [ "$total" = "0" ]
+
+          echo "=== registered tables"
+          curl -fsS $B/tables; echo
+
+          echo "=== coordinator log: shard registrations"
+          docker compose logs coordinator | grep joined
+
+      - name: Logs and cleanup
+        if: always()
+        run: |
+          docker compose --profile scale logs --tail=40 || true
+          docker compose --profile scale down -v --remove-orphans || true
+
+  deploy:
+    needs: build-and-verify
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && vars.DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    concurrency: production
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script_stop: true
+          script: |
+            cd "${{ secrets.DEPLOY_PATH }}"
+            git fetch origin main
+            git reset --hard origin/main
+            docker compose up -d --build --remove-orphans
+            for i in $(seq 1 30); do
+              if curl -fsS http://localhost:8000/health; then echo; exit 0; fi
+              sleep 2
+            done
+            echo "health check failed"; docker compose logs --tail=50; exit 1

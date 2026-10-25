@@ -1,0 +1,617 @@
+openapi: 3.0.3
+info:
+  title: Sharded KV store - coordinator API
+  version: 2.0.0
+  description: |
+    Розподілене key-value сховище. Єдина публічна точка входу - координатор.
+    Він зберігає визначення таблиць, реєстр шардів і за хешем 
+    partition key вирішує, на якому шарді лежить запис.
+
+    **Реплікація.** Кожен шард - це група з N=3 реплік: один лідер і два фолловери.
+    Запис іде на лідера, той дописує його в лог із номером `seq`;
+    фолловери читають лог і застосовують зміни в тому ж порядку. Запис підтверджується,
+    коли його має W реплік (за замовчуванням 2). Читання опитує R живих реплік
+    (за замовчуванням 2) по колу й віддає запис із найбільшою `version`.
+    При R + W > N читання завжди бачить останній підтверджений запис.
+
+    Ключ запису: `pk` (partition key, обовʼязковий) + `sk` (sort key).
+    `sk` потрібен тоді й лише тоді, коли в таблиці оголошено `sort_key`.
+    Усі помилки мають вигляд `{"detail": "..."}`.
+servers:
+  - url: http://localhost:8000
+
+tags:
+  - name: tables
+    description: Реєстрація визначень таблиць
+  - name: records
+    description: CRUD над записами
+  - name: cluster
+    description: Шарди, статистика, службові ендпоїнти
+
+paths:
+  /tables:
+    post:
+      tags: [tables]
+      summary: Зареєструвати визначення таблиці
+      operationId: createTable
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TableDef' }
+            example: { name: orders, partition_key: customer_id, sort_key: order_id }
+      responses:
+        '201':
+          description: Таблицю зареєстровано
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TableDef' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    get:
+      tags: [tables]
+      summary: Список таблиць
+      operationId: listTables
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/TableDef' }
+
+  /tables/{table}:
+    parameters:
+      - $ref: '#/components/parameters/Table'
+    get:
+      tags: [tables]
+      summary: Визначення таблиці
+      operationId: getTable
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TableDef' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /tables/{table}/records:
+    parameters:
+      - $ref: '#/components/parameters/Table'
+    post:
+      tags: [records]
+      summary: CREATE - покласти запис
+      description: Помилка 409, якщо запис із таким ключем уже існує.
+      operationId: createRecord
+      parameters:
+        - $ref: '#/components/parameters/W'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RecordIn' }
+            example: { pk: c42, sk: o1001, value: { total: 99.5, status: new } }
+      responses:
+        '201':
+          description: Створено
+          headers:
+            X-Shard-Id: { $ref: '#/components/headers/ShardId' }
+            X-Leader: { $ref: '#/components/headers/Leader' }
+            X-Version: { $ref: '#/components/headers/Version' }
+            X-Acks: { $ref: '#/components/headers/Acks' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Record' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+    get:
+      tags: [records]
+      summary: READ - прочитати запис
+      operationId: readRecord
+      parameters:
+        - $ref: '#/components/parameters/Pk'
+        - $ref: '#/components/parameters/Sk'
+        - $ref: '#/components/parameters/R'
+      responses:
+        '200':
+          description: OK
+          headers:
+            X-Shard-Id: { $ref: '#/components/headers/ShardId' }
+            X-Read-Replicas: { $ref: '#/components/headers/ReadReplicas' }
+            X-Version: { $ref: '#/components/headers/Version' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Record' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+    put:
+      tags: [records]
+      summary: UPDATE - замінити значення існуючого запису
+      operationId: updateRecord
+      parameters:
+        - $ref: '#/components/parameters/W'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RecordIn' }
+      responses:
+        '200':
+          description: Оновлено
+          headers:
+            X-Shard-Id: { $ref: '#/components/headers/ShardId' }
+            X-Leader: { $ref: '#/components/headers/Leader' }
+            X-Version: { $ref: '#/components/headers/Version' }
+            X-Acks: { $ref: '#/components/headers/Acks' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Record' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+    delete:
+      tags: [records]
+      summary: DELETE - видалити запис
+      operationId: deleteRecord
+      parameters:
+        - $ref: '#/components/parameters/Pk'
+        - $ref: '#/components/parameters/Sk'
+        - $ref: '#/components/parameters/W'
+      responses:
+        '204':
+          description: Видалено
+          headers:
+            X-Shard-Id: { $ref: '#/components/headers/ShardId' }
+            X-Leader: { $ref: '#/components/headers/Leader' }
+            X-Version: { $ref: '#/components/headers/Version' }
+            X-Acks: { $ref: '#/components/headers/Acks' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+
+  /tables/{table}/records/exists:
+    parameters:
+      - $ref: '#/components/parameters/Table'
+    get:
+      tags: [records]
+      summary: EXISTS - чи є значення за ключем
+      operationId: recordExists
+      parameters:
+        - $ref: '#/components/parameters/Pk'
+        - $ref: '#/components/parameters/Sk'
+        - $ref: '#/components/parameters/R'
+      responses:
+        '200':
+          description: OK
+          headers:
+            X-Shard-Id: { $ref: '#/components/headers/ShardId' }
+            X-Read-Replicas: { $ref: '#/components/headers/ReadReplicas' }
+            X-Version: { $ref: '#/components/headers/Version' }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [exists]
+                properties:
+                  exists: { type: boolean }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+
+  /tables/{table}/query:
+    parameters:
+      - $ref: '#/components/parameters/Table'
+    get:
+      tags: [records]
+      summary: Усі записи партиції, відсортовані за sk
+      description: Лише для таблиць із sort key. Усі записи партиції лежать на одному шарді.
+      operationId: queryPartition
+      parameters:
+        - $ref: '#/components/parameters/Pk'
+        - name: sk_prefix
+          in: query
+          schema: { type: string, default: '' }
+          description: Повернути лише записи, чий sk починається з цього префікса
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 100 }
+        - $ref: '#/components/parameters/R'
+      responses:
+        '200':
+          description: OK
+          headers:
+            X-Shard-Id: { $ref: '#/components/headers/ShardId' }
+            X-Read-Replicas: { $ref: '#/components/headers/ReadReplicas' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/QueryResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+
+  /shards:
+    post:
+      tags: [cluster]
+      summary: Зареєструвати репліку шарда
+      description: |
+        Викликається самою реплікою при старті й далі як heartbeat (раз на кілька секунд;
+        без нього репліка за REPLICA_TTL вважається мертвою). `ready=false`, доки репліка
+        не наздогнала лог - з неї не читають. Коли реєструється лідер нового шарда,
+        координатор додає шард у кільце й переносить на нього ключі 
+        через лідерів; у відповіді - звіт про перенесення.
+      operationId: registerReplica
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReplicaIn' }
+            example:
+              shard_id: shard-3
+              replica_id: shard-3-r2
+              url: 'http://shard3-r2:9000'
+              role: follower
+              ready: true
+              applied_seq: 0
+      responses:
+        '200':
+          description: Heartbeat відомої репліки
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReplicaRegistration' }
+        '201':
+          description: Нова репліка додана
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReplicaRegistration' }
+        '409':
+          description: У шарда вже є лідер, або вже є N реплік
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422': { $ref: '#/components/responses/BadRequest' }
+        '500':
+          description: Репліку додано, але rebalance не завершився
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+    get:
+      tags: [cluster]
+      summary: Шарди та їхні репліки (роль, живість, готовність)
+      operationId: listShards
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Shard' }
+
+  /rebalance:
+    post:
+      tags: [cluster]
+      summary: Перебалансувати дані вручну
+      operationId: rebalance
+      responses:
+        '200':
+          description: Звіт
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RebalanceReport' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+
+  /stats:
+    get:
+      tags: [cluster]
+      summary: Кількість записів на шарді та стан кожної репліки
+      operationId: stats
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Stats' }
+
+  /route:
+    get:
+      tags: [cluster]
+      summary: На який шард потрапить ключ
+      operationId: route
+      parameters:
+        - name: table
+          in: query
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/Pk'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  shard_id: { type: string }
+                  leader: { type: string, nullable: true }
+                  replicas: { type: array, items: { type: string } }
+                  hash: { type: integer, format: int64, description: 64-бітний хеш ключа }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+
+  /replicas/{replica_id}/pause:
+    parameters:
+      - $ref: '#/components/parameters/ReplicaId'
+    post:
+      tags: [cluster]
+      summary: Зупинити застосування логу на репліці
+      operationId: pauseReplica
+      responses:
+        '200':
+          description: Репліка перестала читати лог
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PauseState' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+
+  /replicas/{replica_id}/resume:
+    parameters:
+      - $ref: '#/components/parameters/ReplicaId'
+    post:
+      tags: [cluster]
+      summary: Відновити застосування логу
+      operationId: resumeReplica
+      responses:
+        '200':
+          description: Репліка знову читає лог
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PauseState' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+
+  /health:
+    get:
+      tags: [cluster]
+      summary: Liveness
+      operationId: health
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+                  shards: { type: integer }
+                  tables: { type: integer }
+                  replication:
+                    type: object
+                    properties:
+                      N: { type: integer }
+                      W: { type: integer }
+                      R: { type: integer }
+                      strong: { type: boolean, description: 'R + W > N' }
+
+components:
+  headers:
+    Leader:
+      description: Лідер шарда, що прийняв запис
+      schema: { type: string, example: shard-2-r1 }
+    Acks:
+      description: Скільки реплік (разом із лідером) підтвердили запис на момент відповіді
+      schema: { type: integer, example: 2 }
+    Version:
+      description: |
+        Версія запису = seq запису в логу шарда. Для запису - присвоєна версія,
+        для читання - версія, яку повернув кворум.
+      schema: { type: integer, example: 17 }
+    ReadReplicas:
+      description: Репліки, що відповіли на читання (через кому)
+      schema: { type: string, example: 'shard-2-r2,shard-2-r3' }
+    ShardId:
+      description: |
+        Id шарда, який обробив операцію (обраний за хешем partition key).
+        Дозволяє побачити, на який шард потрапив запис і з якого він прочитаний.
+      schema: { type: string, example: shard-2 }
+
+  parameters:
+    W:
+      name: w
+      in: query
+      required: false
+      description: |
+        Скільки реплік (разом із лідером) мають застосувати запис до відповіді.
+        1..N, за замовчуванням WRITE_QUORUM координатора.
+      schema: { type: integer, minimum: 1, maximum: 3 }
+    R:
+      name: r
+      in: query
+      required: false
+      description: |
+        Скільки реплік опитати при читанні (1..N, за замовчуванням READ_QUORUM).
+        Відповідь - запис із найбільшою version серед опитаних.
+      schema: { type: integer, minimum: 1, maximum: 3 }
+    ReplicaId:
+      name: replica_id
+      in: path
+      required: true
+      schema: { type: string, example: shard-1-r2 }
+    Table:
+      name: table
+      in: path
+      required: true
+      schema: { type: string }
+    Pk:
+      name: pk
+      in: query
+      required: true
+      description: Partition key. За його хешем обирається шард.
+      schema: { type: string, minLength: 1, maxLength: 512 }
+    Sk:
+      name: sk
+      in: query
+      required: false
+      description: Sort key. Обовʼязковий, якщо в таблиці оголошено sort_key; інакше заборонений.
+      schema: { type: string, minLength: 1, maxLength: 512 }
+
+  responses:
+    BadRequest:
+      description: Некоректний запит (валідація, sk не відповідає визначенню таблиці)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Таблицю або запис не знайдено
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Conflict:
+      description: Таблиця або запис уже існує
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unavailable:
+      description: Немає шардів, лідер недоступний, або не набрався кворум W (запис) / R (читання)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      required: [detail]
+      properties:
+        detail: { type: string }
+    TableDef:
+      type: object
+      required: [name, partition_key]
+      properties:
+        name:
+          type: string
+          pattern: '^[A-Za-z][A-Za-z0-9_]{0,63}$'
+        partition_key:
+          type: string
+          pattern: '^[A-Za-z][A-Za-z0-9_]{0,63}$'
+          description: Імʼя атрибута-ключа партиції
+        sort_key:
+          type: string
+          nullable: true
+          pattern: '^[A-Za-z][A-Za-z0-9_]{0,63}$'
+          description: Імʼя атрибута sort key (якщо потрібен складений ключ)
+    RecordIn:
+      type: object
+      required: [pk, value]
+      properties:
+        pk: { type: string, minLength: 1, maxLength: 512 }
+        sk: { type: string, nullable: true, minLength: 1, maxLength: 512 }
+        value: { description: Довільний JSON }
+    Record:
+      type: object
+      required: [table, pk, value, version]
+      properties:
+        table: { type: string }
+        pk: { type: string }
+        sk: { type: string, nullable: true }
+        value: { description: Довільний JSON }
+        version: { type: integer, description: seq останнього запису в логу шарда, що змінив цей ключ }
+    QueryResult:
+      type: object
+      properties:
+        table: { type: string }
+        pk: { type: string }
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              sk: { type: string }
+              value: {}
+              version: { type: integer }
+    Replica:
+      type: object
+      properties:
+        id: { type: string, example: shard-1-r2 }
+        url: { type: string }
+        role: { type: string, enum: [leader, follower] }
+        alive: { type: boolean, description: Heartbeat не старший за REPLICA_TTL }
+        ready: { type: boolean, description: Наздогнала лог - з неї можна читати }
+        applied_seq: { type: integer }
+    Shard:
+      type: object
+      required: [id, replicas]
+      properties:
+        id: { type: string }
+        leader: { type: string, nullable: true }
+        replicas:
+          type: array
+          items: { $ref: '#/components/schemas/Replica' }
+    ReplicaIn:
+      type: object
+      required: [shard_id, replica_id, url, role]
+      properties:
+        shard_id: { type: string, pattern: '^[A-Za-z0-9_.-]{1,64}$' }
+        replica_id: { type: string, pattern: '^[A-Za-z0-9_.-]{1,64}$' }
+        url: { type: string, pattern: '^https?://\S+$' }
+        role: { type: string, enum: [leader, follower] }
+        ready: { type: boolean, default: false }
+        applied_seq: { type: integer, default: 0 }
+    ReplicaRegistration:
+      type: object
+      properties:
+        shard_id: { type: string }
+        replica_id: { type: string }
+        role: { type: string }
+        created: { type: boolean }
+        rebalance:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/RebalanceReport'
+    PauseState:
+      type: object
+      properties:
+        replica_id: { type: string }
+        paused: { type: boolean }
+        applied_seq: { type: integer }
+    RebalanceReport:
+      type: object
+      properties:
+        scanned: { type: integer, description: Скільки записів переглянуто }
+        moved: { type: integer, description: Скільки записів переїхало на інший шард }
+        moved_fraction: { type: number }
+        moves:
+          type: object
+          additionalProperties: { type: integer }
+          example: { 'shard-1->shard-3': 340, 'shard-2->shard-3': 330 }
+    Stats:
+      type: object
+      properties:
+        total: { type: integer, description: Записів у кластері (рахується по лідерах) }
+        shards:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              leader: { type: string, nullable: true }
+              records: { type: integer, nullable: true }
+              replicas:
+                type: object
+                additionalProperties:
+                  type: object
+                  properties:
+                    role: { type: string }
+                    alive: { type: boolean }
+                    ready: { type: boolean }
+                    reads_served: { type: integer, description: Скільки читань обслужила репліка }
+                    records: { type: integer }
+                    applied_seq: { type: integer }
+                    lag_bytes: { type: integer, description: Скільки байтів логу ще не застосовано }
+                    paused: { type: boolean }
+                    started_from_seq: { type: integer, description: З якого seq репліка продовжила після рестарту }
+                    applied_since_start: { type: integer, description: Скільки записів застосовано після старту }

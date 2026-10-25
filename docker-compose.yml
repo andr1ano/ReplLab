@@ -1,0 +1,158 @@
+x-replica: &replica
+  build: .
+  restart: unless-stopped
+  command: ["uvicorn", "app.replica:create_app", "--factory", "--host", "0.0.0.0", "--port", "9000"]
+  depends_on:
+    coordinator:
+      condition: service_healthy
+
+x-replica-env: &replica-env
+  COORDINATOR_URL: http://coordinator:8000
+  DB_PATH: /data/replica.db
+  LOG_PATH: /log/shard.log
+  POLL_INTERVAL: "0.2"
+  HEARTBEAT_INTERVAL: "2"
+
+services:
+  coordinator:
+    build: .
+    restart: unless-stopped
+    ports: ["8000:8000"]
+    environment:
+      CATALOG_PATH: /data/catalog.json
+      VNODES: "128"
+      REPLICATION_FACTOR: "3"   # N
+      WRITE_QUORUM: "2"         # W
+      READ_QUORUM: "2"          # R
+      REPLICA_TTL: "6"
+    volumes: ["coordinator-data:/data"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      retries: 10
+
+  shard1-r1:
+    <<: *replica
+    environment:
+      <<: *replica-env
+      SHARD_ID: shard-1
+      REPLICA_ID: shard-1-r1
+      ROLE: leader
+      PUBLIC_URL: http://shard1-r1:9000
+    volumes:
+      - "shard1-r1-data:/data"
+      - "shard1-log:/log:rw"
+
+  shard1-r2:
+    <<: *replica
+    environment:
+      <<: *replica-env
+      SHARD_ID: shard-1
+      REPLICA_ID: shard-1-r2
+      ROLE: follower
+      PUBLIC_URL: http://shard1-r2:9000
+    volumes:
+      - "shard1-r2-data:/data"
+      - "shard1-log:/log:ro"
+
+  shard1-r3:
+    <<: *replica
+    environment:
+      <<: *replica-env
+      SHARD_ID: shard-1
+      REPLICA_ID: shard-1-r3
+      ROLE: follower
+      PUBLIC_URL: http://shard1-r3:9000
+    volumes:
+      - "shard1-r3-data:/data"
+      - "shard1-log:/log:ro"
+
+  shard2-r1:
+    <<: *replica
+    environment:
+      <<: *replica-env
+      SHARD_ID: shard-2
+      REPLICA_ID: shard-2-r1
+      ROLE: leader
+      PUBLIC_URL: http://shard2-r1:9000
+    volumes:
+      - "shard2-r1-data:/data"
+      - "shard2-log:/log:rw"
+
+  shard2-r2:
+    <<: *replica
+    environment:
+      <<: *replica-env
+      SHARD_ID: shard-2
+      REPLICA_ID: shard-2-r2
+      ROLE: follower
+      PUBLIC_URL: http://shard2-r2:9000
+    volumes:
+      - "shard2-r2-data:/data"
+      - "shard2-log:/log:ro"
+
+  shard2-r3:
+    <<: *replica
+    environment:
+      <<: *replica-env
+      SHARD_ID: shard-2
+      REPLICA_ID: shard-2-r3
+      ROLE: follower
+      PUBLIC_URL: http://shard2-r3:9000
+    volumes:
+      - "shard2-r3-data:/data"
+      - "shard2-log:/log:ro"
+
+  shard3-r1:
+    <<: *replica
+    profiles: ["scale"]
+    environment:
+      <<: *replica-env
+      SHARD_ID: shard-3
+      REPLICA_ID: shard-3-r1
+      ROLE: leader
+      PUBLIC_URL: http://shard3-r1:9000
+    volumes:
+      - "shard3-r1-data:/data"
+      - "shard3-log:/log:rw"
+
+  shard3-r2:
+    <<: *replica
+    profiles: ["scale"]
+    environment:
+      <<: *replica-env
+      SHARD_ID: shard-3
+      REPLICA_ID: shard-3-r2
+      ROLE: follower
+      PUBLIC_URL: http://shard3-r2:9000
+    volumes:
+      - "shard3-r2-data:/data"
+      - "shard3-log:/log:ro"
+
+  shard3-r3:
+    <<: *replica
+    profiles: ["scale"]
+    environment:
+      <<: *replica-env
+      SHARD_ID: shard-3
+      REPLICA_ID: shard-3-r3
+      ROLE: follower
+      PUBLIC_URL: http://shard3-r3:9000
+    volumes:
+      - "shard3-r3-data:/data"
+      - "shard3-log:/log:ro"
+
+volumes:
+  coordinator-data:
+  shard1-log:
+  shard1-r1-data:
+  shard1-r2-data:
+  shard1-r3-data:
+  shard2-log:
+  shard2-r1-data:
+  shard2-r2-data:
+  shard2-r3-data:
+  shard3-log:
+  shard3-r1-data:
+  shard3-r2-data:
+  shard3-r3-data:
